@@ -80,27 +80,60 @@ function parsePastedText(text) {
 // ---------------------------------------------------------------------------
 // Fetching + verifying against Ethio Telecom's receipt page
 // ---------------------------------------------------------------------------
-async function fetchReceiptText(txid) {
+async function fetchReceiptText(txid, attempt = 1) {
   const url = `${RECEIPT_BASE_URL}/${encodeURIComponent(txid)}`;
-  const response = await axios.get(url, {
-    httpsAgent: receiptAgent,
-    timeout: 15000,
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    },
-    validateStatus: (status) => status < 500,
-  });
+  const MAX_ATTEMPTS = 3;
+  const TIMEOUT_MS = 30000;
 
-  if (response.status === 404) {
-    throw new Error('Transaction not found (invalid or unrecognized transaction number).');
-  }
-  if (response.status >= 400) {
-    throw new Error(`Receipt server returned status ${response.status}.`);
-  }
+  try {
+    const response = await axios.get(url, {
+      httpsAgent: receiptAgent,
+      timeout: TIMEOUT_MS,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      validateStatus: (status) => status < 500,
+    });
 
-  const $ = cheerio.load(response.data);
-  return $('body').text().replace(/\s+/g, ' ').trim();
+    if (response.status === 404) {
+      throw new Error('Transaction not found (invalid or unrecognized transaction number).');
+    }
+    if (response.status >= 400) {
+      throw new Error(`Receipt server returned status ${response.status}.`);
+    }
+
+    const $ = cheerio.load(response.data);
+    return $('body').text().replace(/\s+/g, ' ').trim();
+  } catch (err) {
+    const isRetryable =
+      err.code === 'ECONNABORTED' ||
+      err.code === 'ETIMEDOUT' ||
+      err.code === 'ECONNRESET' ||
+      err.code === 'ENOTFOUND' ||
+      (err.message && err.message.includes('timeout'));
+
+    console.error(
+      `fetchReceiptText attempt ${attempt} failed for ${txid}: code=${err.code || 'n/a'} message=${err.message}`
+    );
+
+    if (
+      err.message &&
+      (err.message.includes('Transaction not found') || err.message.includes('Receipt server returned'))
+    ) {
+      throw err;
+    }
+
+    if (isRetryable && attempt < MAX_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, attempt * 2000));
+      return fetchReceiptText(txid, attempt + 1);
+    }
+
+    throw new Error(
+      `Could not reach Ethio Telecom's receipt server after ${attempt} attempt(s) (${err.code || err.message}).`
+    );
+  }
 }
 
 function normalizeDigits(str) {
@@ -219,6 +252,28 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
+
+// Debug endpoint: hit this from a browser to see exactly what happens when
+// Render tries to reach Ethio Telecom's receipt server. Remove or protect
+// this route once you've diagnosed the connectivity issue.
+app.get('/debug/receipt/:txid', async (req, res) => {
+  const start = Date.now();
+  try {
+    const text = await fetchReceiptText(req.params.txid);
+    res.status(200).json({
+      ok: true,
+      elapsedMs: Date.now() - start,
+      preview: text.slice(0, 500),
+    });
+  } catch (err) {
+    res.status(200).json({
+      ok: false,
+      elapsedMs: Date.now() - start,
+      errorCode: err.code || null,
+      errorMessage: err.message,
+    });
+  }
 });
 
 app.listen(PORT, () => {
